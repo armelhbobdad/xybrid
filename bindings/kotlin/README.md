@@ -42,6 +42,8 @@ dependencies {
 ```kotlin
 import ai.xybrid.Envelope
 import ai.xybrid.Xybrid
+import ai.xybrid.audioBytes
+import ai.xybrid.runAsync
 
 // Once, in Application.onCreate(): sets the model cache folder, which
 // Android needs before any load.
@@ -71,6 +73,57 @@ import ai.xybrid.Xybrid
 // Load from a local bundle path
 val model = Xybrid.model(ModelSource.bundle("/path/to/model/bundle")).load()
 ```
+
+### Speech (Phonon / Kitten TTS 2)
+
+The arm64-v8a library links the zzz speech engine statically, so arm64
+devices run Phonon and Kitten TTS 2 on-device (Android 10 or later, the SDK's
+floor). The library is chosen by ABI, so arm64-v8a emulator images, such as
+those on Apple Silicon Macs, include speech too. The armeabi-v7a and x86_64
+libraries, including the one x86_64 emulator images load, are built without
+it: there the registry does not serve `phonon-31m-en` and a Kitten bundle
+fails to run. Speech therefore needs the app to load the arm64-v8a library, so
+keep that ABI in any `abiFilters` or App Bundle split.
+
+Both models return raw PCM16 little-endian audio, 24 kHz mono:
+
+```kotlin
+import ai.xybrid.Envelope
+import ai.xybrid.ModelSource
+import ai.xybrid.Xybrid
+import ai.xybrid.audioBytes
+import ai.xybrid.runAsync
+import java.io.File
+
+// Phonon: phonon-31m-en from the registry; voiceId picks one of its voices.
+val phonon = Xybrid.model("phonon-31m-en").load()
+val hello = phonon.runAsync(Envelope.text("Hello from Phonon.", voiceId = "easton"))
+val pcm = hello.audioBytes
+
+// Kitten TTS 2: a local directory holding the four bundle files beside a
+// model_metadata.json with a ZzzEmbed template.
+val kitten = Xybrid.model(ModelSource.directory(File(context.filesDir, "kitten-tts-2").path)).load()
+val speech = kitten.runAsync(Envelope.text("Hello from Kitten."))
+```
+
+[Phonon speech](../../docs/sdk/PHONON.md) lists Phonon's voices and options.
+The Kitten bundle's files, checksums and `model_metadata.json` are in the
+[Unity Kitten sample](../unity/Samples~/KittenTts/README.md); keep
+`accelerate` false on Android and measure `threads` on the target device. To
+play audio while it is synthesized, `runStream` + `streamNext` deliver
+`XybridStreamEventKind.AUDIO` events whose `XybridTtsAudioChunk` carries the
+PCM, sample rate and channel count.
+
+The engine's runtime terms and upstream licenses (fourteen files) ship in the
+AAR under `assets/xybrid/zzz/`, for example
+`assets/xybrid/zzz/RUNTIME_TERMS.md` and
+`assets/xybrid/zzz/LICENSES/Zig-MIT.txt`. Android merges them into your APK,
+so every app that ships the SDK carries them; do not exclude them from
+packaging. Read them with `context.assets.open("xybrid/zzz/RUNTIME_TERMS.md")`,
+for example to show them beside your other open-source notices. The
+Apache-2.0 license in the published POM covers xybrid's own sources; the
+engine linked into arm64-v8a comes under those runtime terms and licenses
+instead.
 
 ### Speech Recognition (ASR)
 
@@ -296,6 +349,11 @@ rm -rf bindings/kotlin/libs && mkdir -p bindings/kotlin/libs /tmp/aar
 unzip -o -q bazel-bin/bindings/kotlin/xybrid-kotlin.aar 'jni/*' -d /tmp/aar
 cp -r /tmp/aar/jni/* bindings/kotlin/libs/
 ```
+
+This local AAR has no speech engine. The released one is built with
+`--//:tts_zzz=true` and a privately staged `aarch64-linux-android` engine
+slice (see [zzz-sys](../../crates/zzz-sys/README.md#android-sdk)), which adds
+the engine to arm64-v8a and its notices under `assets/`.
 
 **Manual Build (without cargo-ndk)**
 

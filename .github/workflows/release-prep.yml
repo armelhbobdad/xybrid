@@ -17,7 +17,8 @@ name: "Release: Prepare"
 #      package manifest (Cargo workspace, pubspec.yaml, package.json,
 #      build.gradle.kts, Package.swift sdkVersion).
 #   2. Builds every release artifact on the release branch (xcframework,
-#      android .so, Flutter precompiled binaries, CLI binaries, web npm package).
+#      android .so with Phonon/Kitten TTS 2 speech in arm64-v8a, Flutter
+#      precompiled binaries, CLI binaries, web npm package).
 #   3. Pulls the xcframework zip, computes its SHA-256, patches
 #      Package.swift's xybridFFIChecksum and the React Native package's
 #      pinned checksum on the release branch, commits and pushes that patch
@@ -36,6 +37,20 @@ name: "Release: Prepare"
 # release lingers until the next release-prep run replaces it.
 #
 # Once the PR merges, release-publish.yml takes over.
+#
+# Android speech: build-android links the private Phonon/Kitten TTS 2 engine
+# into the arm64-v8a slice and fails closed without it, so a release never
+# ships an Android SDK without speech; verify-android-gradle then replays
+# release-publish.yml's Gradle packaging and gate on the release zip, so a
+# packaging failure stops the draft instead of a half-published release. The
+# engine's read credentials live in the `zzz-release` environment (the
+# master-only `zzz-engine` environment stays CI's). Its deployment-branch rule
+# admits release/v* refs, and GitHub checks only the run's ref: any workflow
+# file on a release/v* branch, including an edited copy of this one, can bind
+# it. The real control is who can create or push release/v* branches, so a
+# repository ruleset must restrict those refs to maintainers and the release
+# automation (required reviewers on the environment add a second gate). A
+# non-dry-run dispatch from any other branch fails at build-android.
 
 on:
   push:
@@ -78,6 +93,8 @@ env:
 #   - contents + pull-requests: write -> open-release-pr
 #   - id-token + attestations: write  -> build-xcframework, build-cli-macos,
 #     build-android, build-cli-windows, build-cli-linux (the jobs that call `attest-build-provenance`)
+# Secrets follow the same rule: only build-android binds the `zzz-release`
+# environment, and only its staging step sees the engine credentials.
 # Keeping these off the workflow level means the remaining jobs don't get
 # unnecessary OIDC-issuance, release-write, or attestation-write privileges.
 permissions: read-all
@@ -558,7 +575,8 @@ jobs:
           path: dist-cli/*
 
   # =========================================================================
-  # Android .so files build (Linux with NDK).
+  # Android .so files build: the Kotlin AAR's natives, with Phonon/Kitten
+  # TTS 2 speech linked into arm64-v8a.
   # =========================================================================
   build-android:
     name: Build Android
@@ -566,21 +584,77 @@ jobs:
     if: needs.check-release-branch.outputs.dry_run != 'true'
     needs: [check-release-branch]
     runs-on: ubuntu-latest
+    # The speech engine is a private, pinned archive (crates/zzz-sys). Its
+    # read credentials live in this environment, whose deployment-branch rule
+    # admits release/v* refs. That rule checks only the run's ref, so any
+    # workflow on a release/v* branch can bind it: who may push release/v*
+    # (a repository ruleset) is what actually guards the credentials. The
+    # master-only `zzz-engine` environment stays CI's (test-zzz-engine.yml,
+    # test-zzz-android.yml, trusted-zzz-sdk.yml).
+    environment: zzz-release
     permissions:
       contents: read       # actions/checkout
       id-token: write      # Sigstore OIDC for attest-build-provenance
       attestations: write  # GitHub attestations API
+    # secrets cannot appear in `if:` expressions, so a presence flag rides the
+    # job env. It is a boolean, never the token: job env reaches every step,
+    # including Bazel, which runs this branch's build rules.
+    env:
+      ZZZ_RELEASE_ENABLED: ${{ secrets.ZZZ_GITHUB_TOKEN != '' && secrets.ZZZ_RELEASE_REPOSITORY != '' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           submodules: true
+          persist-credentials: false
+
+      # The only step that sees the engine credentials, and it fails closed:
+      # an Android release must never ship without speech. Like
+      # test-zzz-engine.yml it runs straight after checkout, before any
+      # toolchain, cache restore or Bazel step, with the runner image's gh and
+      # python3. -I keeps tools/scripts/ off sys.path, so nothing beside the
+      # tool can shadow a stdlib module while the token is in the environment.
+      #
+      # zzz_pull.py prints a slice keyed by release/target/profile/checksum;
+      # it moves (same filesystem, modes and bytes unchanged) into a private
+      # 0700 root as <root>/<target>, the layout bazel/zzz/repositories.bzl
+      # resolves per target, as the trusted Apple producer stages
+      # engine-inputs/<target> (tools/scripts/zzz_sdk_stage.py). The archive
+      # cache and the emptied staging tree go right away.
+      - name: Stage the pinned speech engine (arm64-v8a)
+        env:
+          ZZZ_GITHUB_TOKEN: ${{ secrets.ZZZ_GITHUB_TOKEN }}
+          ZZZ_RELEASE_REPOSITORY: ${{ secrets.ZZZ_RELEASE_REPOSITORY }}
+        run: |
+          set -euo pipefail
+          if [ "$ZZZ_RELEASE_ENABLED" != "true" ]; then
+            echo "::error title=Speech engine unavailable::ZZZ_GITHUB_TOKEN/ZZZ_RELEASE_REPOSITORY are not set for this run. The Android SDK ships Phonon/Kitten TTS 2 speech in arm64-v8a, so the release stops here. Run release-prep from a release/v* branch with the zzz-release environment configured."
+            exit 1
+          fi
+          umask 077
+          inputs="$RUNNER_TEMP/zzz-inputs"
+          mkdir -m 0700 "$inputs"
+          for target in aarch64-linux-android; do
+            slice=$(python3 -I tools/scripts/zzz_pull.py --target "$target" \
+              --cache-dir "$RUNNER_TEMP/zzz-cache" --dest "$RUNNER_TEMP/zzz-staging")
+            mv -T -- "$slice" "$inputs/$target"
+          done
+          rm -rf "$RUNNER_TEMP/zzz-cache" "$RUNNER_TEMP/zzz-staging"
+
+      # Re-verify the moved slice against the committed pin, without
+      # credentials, exactly as Bazel's repository rule will.
+      - name: Verify the staged engine inputs
+        env:
+          XYBRID_ZZZ_PREBUILT_DIR: ${{ runner.temp }}/zzz-inputs/aarch64-linux-android
+        run: |
+          set -euo pipefail
+          test "$(stat -c %a "$RUNNER_TEMP/zzz-inputs")" = 700
+          python3 -I tools/scripts/zzz_pull.py --target aarch64-linux-android --verify-only > /dev/null
 
       # Bazel builds the feature-complete 3-ABI AAR (text + candle voice +
-      # mtmd vision) on the shared BuildBuddy cache; the NDK is a pinned Bazel
-      # download (no local SDK/NDK/cargo/boltffi setup). We stage the AAR's
-      # jniLibs into bindings/kotlin/libs/ — the exact layout Gradle publishes
-      # from. Replaces build-android-bolt.sh (boltffi pack + clang-shim relink
-      # + patchelf).
+      # mtmd vision, plus speech in arm64-v8a) on the shared BuildBuddy cache;
+      # the NDK is a pinned Bazel download (no local SDK/NDK/cargo/boltffi
+      # setup). Replaces build-android-bolt.sh (boltffi pack + clang-shim
+      # relink + patchelf).
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
@@ -600,34 +674,147 @@ jobs:
         with:
           macos-sdk-mirror: ${{ vars.MACOS_SDK_MIRROR }}
 
-      - name: Build Android jniLibs (Bazel AAR on RBE)
+      # --//:tts_zzz=true selects the engine only for the AAR's arm64-v8a
+      # slice; armeabi-v7a and x86_64 build exactly as without it. The AAR
+      # also carries the engine's notices at assets/xybrid/zzz/. The repository
+      # rule verifies the staged slice again (zzz_pull.py --verify-only) with
+      # the runner's python3, which it needs at 3.11+.
+      - name: Build the Android AAR with arm64-v8a speech (Bazel on RBE)
         run: |
-          bazelisk build --config=remote -c opt //bindings/kotlin:xybrid_kotlin_aar
-          rm -rf bindings/kotlin/libs && mkdir -p bindings/kotlin/libs /tmp/aar
-          unzip -o -q bazel-bin/bindings/kotlin/xybrid-kotlin.aar 'jni/*' -d /tmp/aar
-          cp -r /tmp/aar/jni/* bindings/kotlin/libs/
-          echo "staged jniLibs:" && ls -R bindings/kotlin/libs
+          set -euo pipefail
+          zzz=(--//:tts_zzz=true
+            "--repo_env=XYBRID_ZZZ_PREBUILT_DIR=$RUNNER_TEMP/zzz-inputs"
+            "--repo_env=XYBRID_ZZZ_PYTHON=$(command -v python3)")
+          bazelisk build --config=remote -c opt "${zzz[@]}" //bindings/kotlin:xybrid_kotlin_aar
+          aar=$(tools/scripts/bazel-output.sh //bindings/kotlin:xybrid_kotlin_aar --config=remote -c opt "${zzz[@]}")
+          mkdir -p "$RUNNER_TEMP/android"
+          cp -L "$aar" "$RUNNER_TEMP/android/xybrid-kotlin.aar"
 
+      # The engine archive against the public libraries linked beside it: no
+      # symbol both defined in the archive (hidden or not) and exported by
+      # libggml*/libllama/libmtmd/libc++_shared/libonnxruntime, so the static
+      # engine cannot interpose on them. A llama.cpp update can reach a
+      # release without the proof lane (test-zzz-android.yml) in between, so
+      # the release checks it on its own bytes. GNU readelf; prints only the
+      # count and names the public libraries export.
+      - name: Engine symbols vs the public libraries beside it
+        run: |
+          set -euo pipefail
+          lib="$RUNNER_TEMP/android/arm64-v8a"
+          mkdir -p "$lib"
+          unzip -q -j "$RUNNER_TEMP/android/xybrid-kotlin.aar" 'jni/arm64-v8a/*' -d "$lib"
+          python3 tools/scripts/verify_zzz_android.py symbol-overlap --readelf readelf \
+            --archive "$RUNNER_TEMP/zzz-inputs/aarch64-linux-android/lib/libzzz_embed.a" \
+            "$lib"/libggml*.so "$lib"/libllama.so "$lib"/libmtmd.so \
+            "$lib"/libc++_shared.so "$lib"/libonnxruntime.so
+          rm -rf "$lib"
+
+      # Nothing after this needs the private inputs; later steps run
+      # third-party actions. always(): a failed step must not leave them either.
+      - name: Delete the staged engine inputs
+        if: always()
+        run: rm -rf "$RUNNER_TEMP"/zzz-*
+
+      # The release gate (GNU readelf, preinstalled on ubuntu-latest): speech
+      # linked into arm64-v8a only, the 14 notices byte-exact, minSdk 29, API
+      # notes 29 (arm64-v8a) / 28 (armeabi-v7a, x86_64), the JNI exports and
+      # no staged engine file anywhere. See tools/scripts/verify_zzz_android.py.
+      - name: Gate the AAR (arm64-v8a speech, notices, API levels)
+        run: |
+          python3 tools/scripts/verify_zzz_android.py aar "$RUNNER_TEMP/android/xybrid-kotlin.aar" \
+            --readelf readelf --speech --min-sdk 29
+
+      # The release zip: the AAR's jni/<abi>/ directories at the root (the
+      # bindings/kotlin/libs/ layout publish-kotlin stages from) plus
+      # assets/xybrid/zzz/, gated again as the exact bytes that ship.
       - name: Prepare artifact with version
         shell: bash
         env:
           TAG: ${{ needs.check-release-branch.outputs.tag }}
         run: |
+          set -euo pipefail
           mkdir -p dist
-          cd bindings/kotlin/libs
-          zip -r ../../../dist/xybrid-android-${TAG}.zip .
+          python3 tools/scripts/verify_zzz_android.py pack-dist \
+            "$RUNNER_TEMP/android/xybrid-kotlin.aar" "dist/xybrid-android-${TAG}.zip"
+          python3 tools/scripts/verify_zzz_android.py dist "dist/xybrid-android-${TAG}.zip" --readelf readelf
 
       - name: Attest Android artifact provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: dist/xybrid-android-${{ needs.check-release-branch.outputs.tag }}.zip
 
+      # The zip links the engine. It becomes a public release asset once the
+      # release publishes; until then keep the Actions copy short-lived (an
+      # abandoned release must not leave it downloadable for 90 days). Three
+      # days still lets a failed create-draft-release be re-run.
       - name: Upload Android artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-libs
           path: dist/xybrid-android-*.zip
           if-no-files-found: error
+          retention-days: 3
+
+  # =========================================================================
+  # Replay release-publish.yml's publish-kotlin on the release zip before the
+  # draft exists: gate the zip, stage it for Gradle, ./gradlew
+  # bundleReleaseAar, gate the Gradle-built AAR. publish-kotlin runs the same
+  # steps again after publish-release has made the tag public; a failure there
+  # (an AGP-added AAR entry, a stripping change) would leave Maven Central and
+  # React Native behind an already public release. A separate job: Gradle runs
+  # third-party plugin code, so it gets no environment, no secrets and no
+  # id-token or attestation rights, and it handles only the gated zip, which
+  # becomes a public release asset anyway.
+  # =========================================================================
+  verify-android-gradle:
+    name: Verify Android Gradle packaging
+    if: needs.check-release-branch.outputs.dry_run != 'true'
+    needs: [check-release-branch, build-android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read  # actions/checkout
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Download the Android release zip
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: android-libs
+          path: artifacts
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3
+        with:
+          packages: platform-tools
+
+      # The same commands as publish-kotlin, on the same bytes.
+      - name: Gate the release zip and stage it for Gradle
+        env:
+          TAG: ${{ needs.check-release-branch.outputs.tag }}
+        run: |
+          set -euo pipefail
+          command -v readelf >/dev/null
+          zip="artifacts/xybrid-android-${TAG}.zip"
+          python3 tools/scripts/verify_zzz_android.py dist "$zip" --readelf readelf
+          python3 tools/scripts/verify_zzz_android.py stage-gradle "$zip" --kotlin-dir bindings/kotlin
+
+      - name: Build the release AAR
+        working-directory: bindings/kotlin
+        run: ./gradlew bundleReleaseAar --console=plain
+
+      - name: Gate the Gradle-built AAR
+        run: |
+          python3 tools/scripts/verify_zzz_android.py aar \
+            bindings/kotlin/build/outputs/aar/xybrid-kotlin-release.aar \
+            --readelf readelf --speech --min-sdk 29
 
   # =========================================================================
   # Flutter precompiled binaries — Linux (waits for build-android sccache).
@@ -1218,6 +1405,7 @@ jobs:
       - build-cli-macos
       - precompile-flutter-darwin
       - build-android
+      - verify-android-gradle
       - build-cli-windows
       - smoke-cli-windows
       - build-cli-linux
@@ -1258,7 +1446,8 @@ jobs:
             echo "### Artifacts"
             echo
             echo "**Android**"
-            echo "- \`xybrid-android-${TAG}.zip\` — Native .so files for arm64-v8a, armeabi-v7a, and x86_64"
+            echo "- Maven Central: \`ai.xybrid:xybrid-kotlin:${TAG#v}\` (minSdk 29, Android 10); arm64-v8a includes Phonon/Kitten TTS 2 speech"
+            echo "- \`xybrid-android-${TAG}.zip\` — Native .so files for arm64-v8a (with Phonon/Kitten TTS 2 speech), armeabi-v7a and x86_64 (without speech), plus the speech engine's notices under \`assets/xybrid/zzz/\`. Copy only the ABI directories into \`jniLibs\`, ship \`assets/xybrid/zzz/\` with your app's assets, and set minSdk 29 (Android 10)"
             echo
             echo "**Flutter**"
             echo "- Precompiled native libraries auto-downloaded by cargokit"
@@ -1287,6 +1476,14 @@ jobs:
           BRANCH: ${{ needs.check-release-branch.outputs.branch }}
         run: |
           set -euo pipefail
+          # android-libs is kept for three days only (it links the speech
+          # engine). A re-run after it expired would otherwise create a draft
+          # without the zip that publish-kotlin needs once the tag is public.
+          if [ ! -f "artifacts/xybrid-android-${TAG}.zip" ]; then
+            echo "::error::artifacts/xybrid-android-${TAG}.zip is missing (the android-libs artifact expires after three days). Re-run all jobs of this workflow."
+            exit 1
+          fi
+
           # If a release already exists for this tag, clean it up *only* if
           # it's still a draft (e.g. a previous release-prep run that never
           # got merged). Refuse to touch published releases — a fixup push
