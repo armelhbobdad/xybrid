@@ -126,6 +126,23 @@ Android is configured as `CMAKE_SYSTEM_NAME=Linux`, so a CMake hook
 set, and `CMAKE_PLATFORM_NO_VERSIONED_SONAME` keeps sonames unversioned (an APK
 only carries `lib*.so`).
 
+**The same platform carries the Android 10 floor; nothing else does.**
+`//bazel/ggml:android_arm64_cpu_variants` also carries
+`//bazel/toolchains/android:api29`, so the AAR's arm64 slice compiles and links
+with `@androidndk_api29` (the pinned NDK at API 29), which is why the Kotlin
+and React Native SDKs require Android 10 (`minSdk 29`). Every other Bazel
+Android target (the AAR's armeabi-v7a / x86_64 slices, the Flutter precompiled
+libraries, the Unity plugin via `--config=android-*`) stays on `@androidndk` at
+API 28 and must not require Android 10. The API-29 toolchain wins only because
+MODULE.bazel registers it before `@androidndk//:all`, whose toolchains match any
+Android platform of their CPU; keep that order. `ggml_cpu_backend.cpp` refuses
+to compile below API 29, so a fallback to API 28 fails the build. CI also reads
+the API level each library was linked for from its `.note.android.ident`
+(`tools/scripts/verify_android_api_level.py`): build-android.yml requires 29 for
+the AAR's arm64 libraries and 28 for its other slices, and
+`verify_unity_android_natives.py` and release-prep's Flutter payload check
+require 28.
+
 
 ### Prebuilt llama.cpp natives (the cargo fast path)
 
